@@ -1,0 +1,195 @@
+# A very simple Navier-Stokes solver for a drop falling in a rectangular
+# domain. The viscosity is taken to be a constant and forward in time,
+# centered in space discretization is used. The density is advected by a 
+# simple upwind scheme.
+using Plots
+
+function set_density!(r, xc, yc, x, y, rad, rho2)
+    Threads.@threads for i=2:size(r,1)-1
+        for j=2:size(r,2)-1
+            if((x[i]-xc)^2 + (y[j]-yc)^2 < rad^2)
+                r[i,j] = rho2
+            end
+        end
+    end
+    return
+end
+
+function set_tangential!(u, usouth, unorth, v, vwest, veast, nx, ny)
+    u[1:nx+1,1] .= 2*usouth .- u[1:nx+1,2]
+    u[1:nx+1,ny+2] .= 2*unorth .- u[1:nx+1,ny+1]
+    v[1,1:ny+1] .= 2*vwest .- v[2,1:ny+1]
+    v[nx+2,1:ny+1] .= 2*veast .- v[nx+1,1:ny+1]
+    return
+end
+
+function temp_uvel!(ut, u, v, r, dt, dx, dy, gx, m0)
+      Threads.@threads for i=2:size(ut,1)-1
+        for j=2:size(ut,2)-1  # TEMPORARY u-velocity
+            ut[i,j] = u[i,j] + dt*(-0.25*(((u[i+1,j]+u[i,j])^2-(u[i,j]+u[i-1,j])^2)/dx +
+            ((u[i,j+1]+u[i,j])*(v[i+1,j]+v[i,j])-(u[i,j]+u[i,j-1])*(v[i+1,j-1]+v[i,j-1]))/dy) +
+            m0/(0.5*(r[i+1,j]+r[i,j]))*((u[i+1,j]-2*u[i,j]+u[i-1,j])/dx^2 +
+            (u[i,j+1]-2*u[i,j]+u[i,j-1])/dy^2 ) + gx)
+        end
+    end
+    return
+end
+
+function temp_vvel!(vt, u, v, r, dt, dx, dy, gy, m0)
+    Threads.@threads for i=2:size(vt,1)-1
+        for j=2:size(vt,2)-1  # TEMPORARY v-velocity
+            vt[i,j] = v[i,j] + dt*(-0.25*(((u[i,j+1]+u[i,j])*(v[i+1,j]+v[i,j]) -
+            (u[i-1,j+1]+u[i-1,j])*(v[i,j]+v[i-1,j]))/dx +
+            ((v[i,j+1]+v[i,j])^2-(v[i,j]+v[i,j-1])^2)/dy) +
+            m0/(0.5*(r[i,j+1]+r[i,j]))*((v[i+1,j]-2*v[i,j]+v[i-1,j])/dx^2 +
+            (v[i,j+1]-2*v[i,j]+v[i,j-1])/dy^2 ) + gy)
+        end
+    end
+    return
+end
+
+function set_boundary!(rt, nx, ny)
+    lrg = 1000
+    rt[1:nx+2,1] .= lrg
+    rt[1:nx+2,ny+2] .= lrg
+    rt[1,1:ny+2] .= lrg
+    rt[nx+2,1:ny+2] .= lrg
+    return
+end
+
+function compute_sources!(tmp1, tmp2, rt, ut, vt, dt, dx, dy, nx, ny)
+    Threads.@threads for i=2:size(tmp1,1)-1
+        for j=2:size(tmp1,2)-1
+        tmp1[i,j] = (0.5/dt)*((ut[i,j]-ut[i-1,j])/dx+(vt[i,j]-vt[i,j-1])/dy)
+        tmp2[i,j] = 1.0/((1.0/dx)*(1.0/(dx*(rt[i+1,j]+rt[i,j])) +
+            1.0/(dx*(rt[i-1,j]+rt[i,j]))) +
+            (1.0/dy)*(1.0/(dy*(rt[i,j+1]+rt[i,j])) +
+            1.0/(dy*(rt[i,j-1]+rt[i,j]))))
+        end
+    end
+end
+
+function solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
+        Threads.@threads for i=2:size(p,1)-1    
+            for j=2:size(p,2)-1
+                p[i,j] = (1.0-beta)*p[i,j] + beta*tmp2[i,j]*(
+                (1.0/dx)*(p[i+1,j]/(dx*(rt[i+1,j]+rt[i,j])) +
+                p[i-1,j]/(dx*(rt[i-1,j]+rt[i,j]))) +
+                (1.0/dy)*(p[i,j+1]/(dy*(rt[i,j+1]+rt[i,j])) +
+                p[i,j-1]/(dy*(rt[i,j-1]+rt[i,j]))) - tmp1[i,j])
+            end
+        end
+    return
+end
+
+function correct_vvel!(v, vt, p, r, dt, dy)
+    Threads.@threads for i=2:size(v,1)-1
+        for j=2:size(v,2)-1  # CORRECT THE v-velocity
+            v[i,j] = vt[i,j] - dt*(2.0/dy)*(p[i,j+1]-p[i,j])/(r[i,j+1]+r[i,j])
+        end
+    end
+    return
+end
+
+function correct_uvel!(u, ut, p, r, dt, dx)
+    Threads.@threads for i=2:size(u,1)-1
+        for j=2:size(u,2)-1  # CORRECT THE u-velocity
+            u[i,j] = ut[i,j] - dt*(2.0/dx)*(p[i+1,j]-p[i,j])/(r[i+1,j]+r[i,j])
+        end
+    end
+    return
+end
+
+function advect_density!(r, ro, u, v, dt, dx, dy, m0, nx, ny)
+    Threads.@threads for i=2:size(r,1)-1
+        for j=2:size(r,2)-1
+            r[i,j] = ro[i,j] - (0.5*dt/dx)*(u[i,j]*(ro[i+1,j] - ro[i,j]) -
+            u[i-1,j]*(ro[i-1,j] - ro[i,j])) -
+            (0.5*dt/dy)*(v[i,j]*(ro[i,j+1] - ro[i,j]) -
+            v[i,j-1]*(ro[i,j-1] - ro[i,j])) +
+            (m0*dt/dx/dx)*(ro[i+1,j] - 2.0*ro[i,j] + ro[i-1,j]) +
+            (m0*dt/dy/dy)*(ro[i,j+1] - 2.0*ro[i,j] + ro[i,j-1])
+        end
+    end
+    return
+end
+
+# domain size and physical variables
+Lx=1.0; Ly=1.0; gx=0;gy= -100.0; rho1=1.0; rho2=2.0; m0=0.01; rro=rho1;
+unorth=0; usouth=0; veast=0; vwest=0; mtime=0.0;
+rad=0.15; xc=0.5; yc=0.7; # Initial drop size and location
+
+# Numerical variables
+nx=8; ny=8; dt=0.00125; nstep=100; maxit=200; maxError=0.001; beta=1.2;
+
+# Zero various arrays
+u=zeros(nx+1,ny+2); v=zeros(nx+2,ny+1); p=ones(nx+2, ny+2);
+ut=zeros(nx+1,ny+2); vt=zeros(nx+2,ny+1); tmp1=zeros(nx+2,ny+2);
+uu=zeros(nx+1,ny+1); vv=zeros(nx+1,ny+1); tmp2=zeros(nx+2,ny+2);
+
+# Set the grid
+dx=Lx/nx; dy=Ly/ny;
+x=[dx*(i-1.5) for i=1:nx+2]; y=[dy*(j-1.5) for j=1:ny+2];
+
+# Set the density
+r=ones(nx+2,ny+2)*rho1;
+set_density!(r, xc, yc, x, y, rad, rho2)
+
+# ======================START TIME LOOP================================
+for is = 1: nstep
+    # tangential velocity at boundaries
+    set_tangential!(u, usouth, unorth, v, vwest, veast, nx, ny)
+
+    # temporary u-velocity
+    temp_uvel!(ut, u, v, r, dt, dx, dy, gx, m0)
+    #println("ut = ", ut)
+    # temporary v-velocity
+    temp_vvel!(vt, u, v, r, dt, dx, dy, gy, m0)
+    #println("vt = ", vt)
+    #exit()
+    # Compute source term and the coefficient for p(i,j)
+    rt = copy(r)
+    set_boundary!(rt, nx, ny)
+    #println("rt = ", rt)
+    #exit()
+    compute_sources!(tmp1, tmp2, rt, ut, vt, dt, dx, dy, nx, ny)
+    #println("tmp1 = ", tmp1)
+    #println("tmp2 = ", tmp2)
+    #exit()
+    # Solve for pressure
+    for it=1:maxit  # SOLVE FOR PRESSURE
+        oldArray = copy(p)
+        solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
+        #println("p = ", p)
+        #exit()
+        if maximum(abs.(oldArray .- p)) < maxError
+            break
+        end
+    end
+    # correct u-velocity
+    correct_uvel!(u, ut, p, r, dt, dx)
+
+    # correct v-velocity
+    correct_vvel!(v, vt, p, r, dt, dy)
+
+    # ADVECT DENSITY using centered difference plus diffusion
+    ro = copy(r)
+    advect_density!(r, ro, u, v, dt, dx, dy, m0, nx, ny)
+
+    global mtime = mtime + dt  # plot the results
+    uu[1:nx+1,1:ny+1] .= 0.5 .* (u[1:nx+1,2:ny+2] .+ u[1:nx+1,1:ny+1])
+    vv[1:nx+1,1:ny+1] .= 0.5 .* (v[2:nx+2,1:ny+1] .+ v[1:nx+1,1:ny+1])
+    xh = [dx*(i-1) for i=1:nx+1]
+    yh = [dy*(j-1) for j=1:ny+1]
+
+    # The following lines are for plotting which is typically done using packages like Plots.jl or PyPlot.jl in Julia.
+    # Here is an example of how you might do it using Plots.jl:
+
+    if is % 10 == 0
+        println("time = ", mtime)
+        contour(x, y, r', aspect_ratio=:equal, xlims=(0, Lx), ylims=(0, Ly))
+        quiver!(xh, yh, quiver=(uu', vv'), color=:red)
+        Plots.savefig("out_vis1/step_$is.png")
+    end
+end
+
