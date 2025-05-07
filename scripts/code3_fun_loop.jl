@@ -286,7 +286,7 @@ end
 
 # domain size and physical variables
 Lx = 1.0; Ly = 1.0
-gx = 0.0; gy = -100.0
+gx = 0.0; gy = 100.0
 rho1 = 1.0; rho2 = 2.0
 m1 = 0.01; m2 = 0.05
 sigma = 10
@@ -296,7 +296,7 @@ rad = 0.15; xc = 0.5; yc = 0.3  # Initial drop size and location
 
 # Numerical variables
 nx = 64; ny = 64;
-dt = 0.00025
+dt = 0.0005
 nstep = 300; maxit = 200
 maxError = 0.001; beta = 1.2
 
@@ -431,7 +431,6 @@ for is in 1:nstep
         advect_front!(uf, vf, xf, yf, u, v, dx, dy, Nf)
         # move the front
         move_front!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
-        
         fx = zeros(nx+2, ny+2)
         fy = zeros(nx+2, ny+2)  # Set fx & fy to zero
         distribute!(fx, fy, xf, yf, rho1, rho2, dx, dy, Nf)
