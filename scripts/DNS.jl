@@ -11,7 +11,7 @@ end
 using LinearAlgebra, Printf
 using MAT, Plots
 
-#@views function main(; do_vis=true, do_save=false)
+@views function main(; do_vis=true, do_save=false)
     # physics
     Lx = 1.0 # [m]
     Ly = 1.0 # [m]
@@ -36,7 +36,7 @@ using MAT, Plots
     dt = 0.00125
     nsteps = 100
     nvis = 10
-    maxit = 200
+    maxit = 400
     maxerr = 1e-3
     beta = 1.2
 
@@ -60,7 +60,7 @@ using MAT, Plots
     vv = @zeros(nx+1, ny+1)
     tmp1 = @zeros(nx+2, ny+2)
     tmp2 = @zeros(nx+2, ny+2)
-
+    if do_save !ispath("./out_dns") && mkdir("./out_dns"); matwrite("out_dns/step_0.mat",Dict("Vx"=>Array(uu),"Vy"=>Array(vv),"C"=>Array(ρ),"dx"=>dx,"dy"=>dy)) end
     ρ .= ρ₁
     @hide_communication (16,2,2) begin
         # set the density
@@ -72,9 +72,9 @@ using MAT, Plots
             # tangential velocity
             @parallel set_tangential!(u, v, usouth, unorth, vwest, veast)
             # temporary u-velocity
-            @parallel temp_uvel!(ut, u, ρ, dt, dx, dy, g, m0)
+            @parallel temp_uvel!(ut, u, ρ, dt, dx, dy, gx, m0)
             # temporary v-velocity
-            @parallel temp_vvel!(vt, v, ρ, dt, dx, dy, g, m0)
+            @parallel temp_vvel!(vt, v, ρ, dt, dx, dy, gy, m0)
             # compute source term
             @parallel set_boundary!(ρₜ, ρ)
             @parallel compute_source!(tmp1, tmp2, ρ, ut, vt, dt, dx, dy)
@@ -86,6 +86,10 @@ using MAT, Plots
                 if maximum(abs.(oldp-p)) < maxerr
                     break
                 end
+                # print if number of iterations is large
+                if it == maxit
+                    @printf("Warning: pressure solver did not converge in %d iterations\n", it)
+                end
             end
             # correct u-velocity
             @parallel correct_uvel!(u, ut, p, ρ, dt, dx)
@@ -96,6 +100,11 @@ using MAT, Plots
             # calculate the velocity at the cell centers
             @parallel velocity!(u, v, uu, vv)
             if is % nvis == 0
+                # save the data
+                if do_save
+                    matwrite("out_dns/step_$(nstep).mat",Dict("Vx"=>Array(uu),"Vy"=>Array(vv),"C"=>Array(ρ),"dx"=>dx,"dy"=>dy))
+                    nstep += 1
+                end
                 println("time = $time")
                 p3=heatmap(xc,yc,Array(uu)';aspect_ratio=1,xlims=(0,Lx),ylims=(0,Ly),title="UU")
                 p4=heatmap(xc,yc,Array(vv)';aspect_ratio=1,xlims=(0,Lx),ylims=(0,Ly),title="VV")
@@ -104,7 +113,7 @@ using MAT, Plots
         end
     end
 
-#end
+end
 
 @parallel_indices (ix,iy) function set_tangential!(u,v,usouth, unorth,vwest, veast )
     if ix > 1 && ix < size(u,1) && iy > 1 && iy < size(v,2)
@@ -211,3 +220,4 @@ end
 end
 
 
+main(do_vis=true, do_save=true)

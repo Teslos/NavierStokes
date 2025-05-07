@@ -11,7 +11,7 @@ end
 using LinearAlgebra, Printf
 using MAT, Plots
 
-#@views function main(; do_vis=true, do_save=false)
+@views function main(; do_vis=true, do_save=true)
     # physics
     Lx = 1.0 # [m]
     Ly = 1.0 # [m]
@@ -40,9 +40,17 @@ using MAT, Plots
     maxerr = 1e-3
     beta = 1.2
 
+    CFLτ      = 0.9/sqrt(2)
+    CFL_visc  = 1/4.1
+    CFL_adv   = 1.0
+
+
     # set the grid
     dx = Lx/nx
     dy = Ly/ny
+    dt = min(CFL_visc*dy^2*ρ₁/m0, CFL_adv*dy/1.0)
+    println("dt = $dt")
+
     xc = LinRange(-0.5*dx, Lx+0.5*dx, nx+2)
     yc = LinRange(-0.5*dy, Ly+0.5*dy, ny+2)
     xv = LinRange(0.0, Lx, nx+1)
@@ -60,7 +68,8 @@ using MAT, Plots
     vv = @zeros(nx+1, ny+1)
     tmp1 = @zeros(nx+2, ny+2)
     tmp2 = @zeros(nx+2, ny+2)
-
+    if do_save !ispath("./out_dns") && mkdir("./out_dns"); matwrite("out_dns/step_0.mat",Dict("Vx"=>Array(uu),"Vy"=>Array(vv),"C"=>Array(ρ),"dx"=>dx,"dy"=>dy)) end
+    # action
     ρ .= ρ₁
     @hide_communication (16,2,2) begin
         # set the density
@@ -72,9 +81,9 @@ using MAT, Plots
             # tangential velocity
             @parallel set_tangential!(u, v, usouth, unorth, vwest, veast)
             # temporary u-velocity
-            @parallel temp_uvel!(ut, u, ρ, dt, dx, dy, g, m0)
+            @parallel temp_uvel!(ut, u, ρ, dt, dx, dy, gx, m0)
             # temporary v-velocity
-            @parallel temp_vvel!(vt, v, ρ, dt, dx, dy, g, m0)
+            @parallel temp_vvel!(vt, v, ρ, dt, dx, dy, gy, m0)
             # compute source term
             @parallel set_boundary!(ρₜ, ρ)
             @parallel compute_source!(tmp1, tmp2, ρ, ut, vt, dt, dx, dy)
@@ -96,6 +105,10 @@ using MAT, Plots
             # calculate the velocity at the cell centers
             @parallel velocity!(u, v, uu, vv)
             if is % nvis == 0
+                # save the data
+                if do_save
+                    matwrite("out_dns/step_$(is).mat", Dict("Vx"=>Array(uu),"Vy"=>Array(vv),"C"=>Array(ρ),"dx"=>dx,"dy"=>dy))
+                end
                 println("time = $time")
                 p3=heatmap(xc,yc,Array(uu)';aspect_ratio=1,xlims=(0,Lx),ylims=(0,Ly),title="UU")
                 p4=heatmap(xc,yc,Array(vv)';aspect_ratio=1,xlims=(0,Lx),ylims=(0,Ly),title="VV")
@@ -104,7 +117,7 @@ using MAT, Plots
         end
     end
 
-#end
+end
 
 @parallel_indices (ix,iy) function set_tangential!(u,v,usouth, unorth,vwest, veast )
     if ix > 1 && ix < size(u,1) && iy > 1 && iy < size(v,2)
@@ -210,4 +223,4 @@ end
     return
 end
 
-
+main(do_vis=true, do_save=true)

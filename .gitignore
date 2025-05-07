@@ -1,5 +1,6 @@
 Manifest.toml
 out_vis/
+out_dns/
 out_vis1/
 tmp/
 .DS_Store
