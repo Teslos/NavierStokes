@@ -26,15 +26,16 @@ function set_front!(xf, yf, rad, Nf)
     return
 end
 
-function set_tangential!(u,usouth,unorth,v,vwest,veast,nx,ny)
+function set_tangential!(u, usouth, unorth, v, vwest, veast, nx, ny)
     i = (blockIdx().x-1) * blockDim().x + threadIdx().x
     j = (blockIdx().y-1) * blockDim().y + threadIdx().y
-    if ( i <= size(u,1) && j <= size(v,2) )
-        # tangential velocity at boundaries
-        u[i, 1] .= 2 * usouth .- u[i, 2]
-        u[i, ny+2] .= 2 * unorth .- u[1:nx+1, ny+1]
-        v[1, j] .= 2 * vwest .- v[2, j]
-        v[nx+2, j] .= 2 * veast .- v[nx+1, j]
+    if (i <= size(u,1) && j <= size(v,2))
+        u[i,1] = 2*usouth - u[i,2]
+        u[i,ny+2] = 2*unorth - u[i,ny+1]
+    
+        v[1,j] = 2*vwest - v[2,j]
+        v[nx+2,j] = 2*veast - v[nx+1,j]
+    end 
     return
 end
 
@@ -197,7 +198,7 @@ end
 
 function distribute!(fx, fy, xf, yf, rho1, rho2, dx, dy, Nf)
     #------------ distribute gradient --------------
-    Threads.@threads for l=2:Nf+1
+    for l=2:Nf+1
         nfx = -0.5 * (yf[l+1] - yf[l-1]) * (rho2 - rho1)
         nfy = 0.5 * (xf[l+1] - xf[l-1]) * (rho2 - rho1)  # Normal vector
 
@@ -240,6 +241,18 @@ function update_visco!(r,m,m1,m2,rho1,rho2,nx,ny)
     j = (blockIdx().y-1) * blockDim().y + threadIdx().y
     if (i > 1 && i <= size(m,1)-1 && j > 1 && j <= size(m,2)-1)
             m[i,j] = m1 + (m2 - m1) * (r[i,j] - rho1) / (rho2 - rho1)
+    end
+    return
+end
+
+function set_boundary_rt!(rt, nx, ny, lrg)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y-1) * blockDim().y + threadIdx().y
+    if (i <= size(rt,1) && j <= size(rt,2))
+        rt[i, 1] = 1000
+        rt[i, ny+2] = 1000
+        rt[1, j] = 1000
+        rt[nx+2, j] = 1000
     end
     return
 end
@@ -305,7 +318,7 @@ GRIDY = 8*4
 
 # Numerical variables
 nx = BLOCKX*GRIDX; ny = BLOCKY*GRIDY;
-dt = 0.0005
+dt = 0.00005
 nstep = 300; maxit = 200
 maxError = 0.001; beta = 1.2
 
@@ -343,8 +356,7 @@ mn = CUDA.zeros(nx+2, nx+2)   # second order
 
 cuthreads = (BLOCKX+2, BLOCKY+2)
 cublocks = (GRIDX+2, GRIDY+2)
-@cuda blocks=cublocks threads=cuthreads
-set_density_viscosity!(r, m, xc, yc, x, y, rad, rho2, m2)
+@cuda blocks=cublocks threads=cuthreads set_density_viscosity!(r, m, xc, yc, x, y, rad, rho2, m2)
 synchronize()
 
 dt = min(dt,0.25 * min(dx, dy)^2 *min(rho1, rho2) / maximum(m))
@@ -362,11 +374,12 @@ tx = zeros(Nf+2)
 ty = zeros(Nf+2)
 
 set_front!(xf, yf, rad, Nf)
+println("xf: ", xf)
 
 
 # -------------------- START TIME LOOP ------------------------
 for is in 1:nstep
-    global u, v, p, r, ut, vt, tmp1, uu, vv, tmp2, fx, fy, un, vn, rn, m, mn, xf, yf, xfn, yfn, tx, ty, uf, vf, Nf, time
+    #global u, v, p, r, ut, vt, tmp1, uu, vv, tmp2, fx, fy, un, vn, rn, m, mn, xf, yf, xfn, yfn, tx, ty, uf, vf, Nf, time
     un = copy(u)
     vn = copy(v)
     rn = copy(r)
@@ -413,70 +426,65 @@ for is in 1:nstep
             fy[ip, jp+1] = fy[ip, jp+1] + (1.0 - ax) * ay * nfy / dx / dy
             fy[ip+1, jp+1] = fy[ip+1, jp+1] + ax * ay * nfy / dx / dy
         end
-        
+        println("First kernel done")
+        fx = CuArray(fx)
+        fy = CuArray(fy) 
         # tangential velocity at boundaries
-        @cuda blocks=cublocks threads=cuthreads
-        set_tangential!(u,usouth,unorth, v, vwest, veast, nx, ny)
+        println("type of u: ", typeof(u))
+        @cuda blocks=cublocks threads=cuthreads set_tangential!(u, usouth, unorth, v, vwest, veast, nx, ny)
         synchronize()
         # temporary u-velocity - advection
-        @cuda blocks=cublocks threads=cuthreads
-        temp_uvel_adv!(ut, u, v, r, dt, dx, dy, fx, gx, rro)
+        @cuda blocks=cublocks threads=cuthreads temp_uvel_adv!(ut, u, v, r, dt, dx, dy, fx, gx, rro)
         synchronize()
         # temporary v-velocity - advection
-        @cuda blocks=cublocks threads=cuthreads
-        temp_vvel_adv!(vt, u, v, r, dt, dx, dy, fy, gy, rro)
+        @cuda blocks=cublocks threads=cuthreads temp_vvel_adv!(vt, u, v, r, dt, dx, dy, fy, gy, rro)
         synchronize()
         # temporary u-velocity - diffusion
-        @cuda blocks=cublocks threads=cuthreads
-        temp_uvel_diff!(ut, u, v, r, dt, dx, dy, m)
+        @cuda blocks=cublocks threads=cuthreads temp_uvel_diff!(ut, u, v, r, dt, dx, dy, m)
         synchronize()
         # temporary v-velocity - diffusion
-        @cuda blocks=cublocks threads=cuthreads
-        temp_vvel_diff!(vt, u, v, r, dt, dx, dy, m)
+        @cuda blocks=cublocks threads=cuthreads temp_vvel_diff!(vt, u, v, r, dt, dx, dy, m)
         synchronize()
         
-        rt = copy(r)
+        rt = CUDA.copy(r)
         lrg = 1000
-        rt[1:nx+2, 1] .= lrg
-        rt[1:nx+2, ny+2] .= lrg
-        rt[1, 1:ny+2] .= lrg
-        rt[nx+2, 1:ny+2] .= lrg
-        @cuda blocks=cublocks threads=cuthreads
-        compute_sources!(tmp1, tmp2, rt, ut, vt, dt, dx, dy, nx, ny)
+        # Set the boundary conditions for the temporary density
+
+        @cuda blocks=cublocks threads=cuthreads set_boundary_rt!(rt, nx, ny, lrg)
+        @cuda blocks=cublocks threads=cuthreads compute_sources!(tmp1, tmp2, rt, ut, vt, dt, dx, dy, nx, ny)
         synchronize()
         for it = 1:maxit # Solve for pressure
             oldArray = CUDA.copy(p)
-            @cuda blocks=cublocks threads=cuthreads
-            solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
+            @cuda blocks=cublocks threads=cuthreads solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
             synchronize()
             # Check for convergence
             max_diff = CUDA.@sync CUDA.reduce(max, abs.(oldArray .- p))
+            println("max_diff = ", max_diff)
             if max_diff < maxError
                 break
             end
         end
         # correct the u-velocity field
-        @cuda blocks=cublocks threads=cuthreads 
-        correct_uvel!(u, ut, p, r, dt, dx)
+        @cuda blocks=cublocks threads=cuthreads correct_uvel!(u, ut, p, r, dt, dx)
         synchronize()
         # correct the v-velocity field
-        @cuda blocks=cublocks threads=cuthreads
-        correct_vvel!(v, vt, p, r, dt, dy)
+        @cuda blocks=cublocks threads=cuthreads correct_vvel!(v, vt, p, r, dt, dy)
         synchronize()
         # advect the front
+        u = Array(u)
+        v = Array(v)
+
+
         advect_front!(uf, vf, xf, yf, u, v, dx, dy, Nf)
         # move the front
         move_front!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
-        fx = CUDA.zeros(nx+2, ny+2)
-        fy = CUDA.zeros(nx+2, ny+2)  # Set fx & fy to zero
-        @cuda blocks=cublocks threads=cuthreads
+        fx = zeros(nx+2, ny+2)
+        fy = zeros(nx+2, ny+2)  # Set fx & fy to zero
         distribute!(fx, fy, xf, yf, rho1, rho2, dx, dy, Nf)
-        synchronize()
         #-----------construct the density---------------
         for iter=1:maxit
             oldArray = CUDA.copy(r)
-            @cuda blocks=cublocks threads=cuthreads
-            construct_den!(r, fx, fy, beta, maxit, maxError, dx, dy, nx, ny)
+            @cuda blocks=cublocks threads=cuthreads construct_den!(r, fx, fy, beta, maxit, maxError, dx, dy, nx, ny)
             synchronize()
             # Check for convergence
             max_diff = CUDA.@sync CUDA.reduce(max, abs.(oldArray .- r))
@@ -487,8 +495,7 @@ for is in 1:nstep
 
         #------------ update the viscosity --------------
         m = CUDA.zeros(nx+2, ny+2) .+ m1
-        @cuda blocks=cublocks threads=cuthreads
-        update_visco!(r, m, m1, m2, rho1, rho2, nx, ny)
+        @cuda blocks=cublocks threads=cuthreads update_visco!(r, m, m1, m2, rho1, rho2, nx, ny)
         synchronize()
 
     end # end the time iteration---second order   

@@ -420,6 +420,7 @@ for is in 1:nstep
         for it = 1:maxit # Solve for pressure
             oldArray = copy(p)
             solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
+            println("maximum error: ", maximum(abs.(oldArray .- p)))
             if maximum(abs.(oldArray .- p)) < maxError
                 break
             end
