@@ -42,6 +42,7 @@ end
 function temp_uvel_adv!(ut, u, v, r, dt, dx, dy, fx, gx, rro)
     i = (blockIdx().x-1) * blockDim().x + threadIdx().x
     j = (blockIdx().y-1) * blockDim().y + threadIdx().y
+
     if (i > 1 && i <= size(ut,1)-1 && j > 1 && j <= size(ut,2)-1)
             ut[i, j] = u[i, j] + dt * (-0.25 * 
             (((u[i+1, j] + u[i, j])^2 - (u[i, j] + u[i-1, j])^2) / dx 
@@ -110,6 +111,7 @@ function compute_sources!(tmp1, tmp2, rt, ut, vt, dt, dx, dy, nx, ny)
     return
 end 
 
+# This function is not used in the code because it is not GPU compatible
 function solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
     # solve for pressure
     i = (blockIdx().x-1) * blockDim().x + threadIdx().x
@@ -123,6 +125,76 @@ function solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxErro
     end
     return
 end 
+# Red kernel (updates cells where i+j is even)
+function solve_pressure_kernel_red!(p, tmp1, tmp2, rt, beta, dx, dy)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y-1) * blockDim().y + threadIdx().y
+    
+    if (i > 1 && i <= size(p,1)-1 && j > 1 && j <= size(p,2)-1)
+        # Only update red cells (i+j is even)
+        if (i + j) % 2 == 0
+            p[i,j] = (1.0-beta)*p[i,j] + beta*tmp2[i,j]*(
+            (1.0/dx)*(p[i+1,j]/(dx*(rt[i+1,j]+rt[i,j])) +
+            p[i-1,j]/(dx*(rt[i-1,j]+rt[i,j]))) +
+            (1.0/dy)*(p[i,j+1]/(dy*(rt[i,j+1]+rt[i,j])) +
+            p[i,j-1]/(dy*(rt[i,j-1]+rt[i,j]))) - tmp1[i,j])
+        end
+    end
+    return
+end
+
+# Black kernel (updates cells where i+j is odd)
+function solve_pressure_kernel_black!(p, tmp1, tmp2, rt, beta, dx, dy)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y-1) * blockDim().y + threadIdx().y
+    
+    if (i > 1 && i <= size(p,1)-1 && j > 1 && j <= size(p,2)-1)
+        # Only update black cells (i+j is odd)
+        if (i + j) % 2 == 1
+            p[i,j] = (1.0-beta)*p[i,j] + beta*tmp2[i,j]*(
+            (1.0/dx)*(p[i+1,j]/(dx*(rt[i+1,j]+rt[i,j])) +
+            p[i-1,j]/(dx*(rt[i-1,j]+rt[i,j]))) +
+            (1.0/dy)*(p[i,j+1]/(dy*(rt[i,j+1]+rt[i,j])) +
+            p[i,j-1]/(dy*(rt[i,j-1]+rt[i,j]))) - tmp1[i,j])
+        end
+    end
+    return
+end
+
+# Function to launch the GPU kernels for a single Red-Black SOR iteration
+function solve_pressure_redblack_gpu!(p, tmp1, tmp2, rt, beta, dx, dy)
+    nx, ny = size(p)
+    threads = (16, 16)
+    blocks = (cld(nx, threads[1]), cld(ny, threads[2]))
+    
+    # First update red cells
+    @cuda blocks=blocks threads=threads solve_pressure_kernel_red!(p, tmp1, tmp2, rt, beta, dx, dy)
+    
+    # Synchronize to ensure all red updates are complete
+    CUDA.synchronize()
+    
+    # Then update black cells
+    @cuda blocks=blocks threads=threads solve_pressure_kernel_black!(p, tmp1, tmp2, rt, beta, dx, dy)
+    
+    # Synchronize again
+    CUDA.synchronize()
+    
+    return
+end
+
+function solve_pressure_kernel_jacobi!(p_new, p_old, tmp1, tmp2, rt, beta, dx, dy)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y-1) * blockDim().y + threadIdx().y
+    
+    if (i > 1 && i <= size(p_new,1)-1 && j > 1 && j <= size(p_new,2)-1)
+        p_new[i,j] = (1.0-beta)*p_old[i,j] + beta*tmp2[i,j]*(
+        (1.0/dx)*(p_old[i+1,j]/(dx*(rt[i+1,j]+rt[i,j])) +
+        p_old[i-1,j]/(dx*(rt[i-1,j]+rt[i,j]))) +
+        (1.0/dy)*(p_old[i,j+1]/(dy*(rt[i,j+1]+rt[i,j])) +
+        p_old[i,j-1]/(dy*(rt[i,j-1]+rt[i,j]))) - tmp1[i,j])
+    end
+    return
+end
 
 function correct_uvel!(u, ut, p, r, dt, dx)
   i = (blockIdx().x-1) * blockDim().x + threadIdx().x
@@ -139,6 +211,38 @@ function correct_vvel!(v, vt, p, r, dt, dy)
     j = (blockIdx().y-1) * blockDim().y + threadIdx().y
     if (i > 1 && i <= size(v,1)-1 && j > 1 && j <= size(v,2)-1)
             v[i,j] = vt[i,j] - dt * (2.0/dy) * (p[i,j+1] - p[i,j]) / (r[i,j+1] + r[i,j])
+    end
+    return
+end
+# GPU kernel version
+function advect_front_kernel!(uf, vf, xf, yf, u, v, dx, dy, Nf)
+    # Get thread ID (each thread processes one front point)
+    l = threadIdx().x + (blockIdx().x - 1) * blockDim().x
+    
+    if l >= 2 && l <= Nf+1
+        # For u velocity
+        ip = Int(floor(xf[l] / dx)) + 1
+        jp = Int(floor((yf[l] + 0.5 * dy) / dy)) + 1
+        ax = xf[l] / dx - ip + 1
+        ay = (yf[l] + 0.5 * dy) / dy - jp + 1
+
+        v1 = (1.0-ax)*(1.0-ay)*u[ip,jp]
+        v2 = ax*(1.0-ay)*u[ip+1,jp]
+        v3 = (1.0-ax)*ay*u[ip,jp+1]
+        v4 = ax*ay*u[ip+1,jp+1]
+        uf[l] = v1+v2+v3+v4
+
+        # For v velocity
+        ip = Int(floor((xf[l] + 0.5 * dx) / dx)) + 1
+        jp = Int(floor(yf[l] / dy)) + 1
+        ax = (xf[l] + 0.5 * dx) / dx - ip + 1
+        ay = yf[l] / dy - jp + 1
+        
+        v1 = (1.0-ax)*(1.0-ay)*v[ip,jp]
+        v2 = ax*(1.0-ay)*v[ip+1,jp]
+        v3 = (1.0-ax)*ay*v[ip,jp+1]
+        v4 = ax*ay*v[ip+1,jp+1]
+        vf[l] = v1+v2+v3+v4
     end
     return
 end
@@ -193,6 +297,55 @@ function move_front!(xf,yf,uf,vf,Nf,dt,Lx,Ly)
     yf[1] = yf[Nf+1]
     xf[Nf+2] = xf[2]
     yf[Nf+2] = yf[2]
+    return
+end
+
+# GPU kernel version
+function move_front_kernel!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
+    # Get thread ID (each thread processes one front point)
+    i = threadIdx().x + (blockIdx().x - 1) * blockDim().x
+    
+    if i >= 2 && i <= Nf+1
+        # Update position
+        xf[i] = xf[i] + dt * uf[i]
+        yf[i] = yf[i] + dt * vf[i]
+        
+        # Check bounds (using atomicAdd to avoid race conditions in printing)
+        if (xf[i] < 0.0 || xf[i] > Lx || yf[i] < 0.0 || yf[i] > Ly)
+            # Note: We can't print from GPU kernels, so we'll just handle this differently
+            # For example, we could set a flag or record the out-of-bounds point
+            # Here we'll just clamp the values to the domain boundaries
+            xf[i] = max(0.0, min(Lx, xf[i]))
+            yf[i] = max(0.0, min(Ly, yf[i]))
+        end
+    end
+    return
+end
+
+# Function to handle the boundary points (first and last)
+function handle_boundary_points_kernel!(xf, yf, Nf)
+    # This kernel should be called with only one thread
+    if threadIdx().x == 1 && blockIdx().x == 1
+        xf[1] = xf[Nf+1]
+        yf[1] = yf[Nf+1]
+        xf[Nf+2] = xf[2]
+        yf[Nf+2] = yf[2]
+    end
+    return
+end
+
+# Function to launch the GPU kernels
+function move_front_gpu!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
+    # Configure kernel launch parameters for main kernel
+    threads_per_block = 256
+    num_blocks = cld(Nf, threads_per_block)
+    
+    # Launch main kernel
+    @cuda blocks=num_blocks threads=threads_per_block move_front_kernel!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
+    
+    # Launch boundary points kernel with just one thread
+    @cuda blocks=1 threads=1 handle_boundary_points_kernel!(xf, yf, Nf)
+    
     return
 end
 
@@ -455,8 +608,7 @@ for is in 1:nstep
         synchronize()
         for it = 1:maxit # Solve for pressure
             oldArray = CUDA.copy(p)
-            @cuda blocks=cublocks threads=cuthreads solve_pressure!(p, tmp1, tmp2, rt, beta, dx, dy, nx, ny, maxit, maxError)
-            synchronize()
+            solve_pressure_redblack_gpu!(p, tmp1, tmp2, rt, beta, dx, dy)
             # Check for convergence
             max_diff = CUDA.@sync CUDA.reduce(max, abs.(oldArray .- p))
             println("max_diff = ", max_diff)
@@ -471,19 +623,23 @@ for is in 1:nstep
         @cuda blocks=cublocks threads=cuthreads correct_vvel!(v, vt, p, r, dt, dy)
         synchronize()
         # advect the front
-        u = Array(u)
-        v = Array(v)
+        #u_adv = Array(u)
+        #v_adv = Array(v)
 
-
-        advect_front!(uf, vf, xf, yf, u, v, dx, dy, Nf)
+        @cuda blocks=cublocks threads=cuthreads advect_front_kernel!(uf, vf, xf, yf, u, v, dx, dy, Nf)
+        synchronize()
+        # advect_front!(uf, vf, xf, yf, u_adv, v_adv, dx, dy, Nf)
         # move the front
-        move_front!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
+        # move_front!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
+        move_front_gpu!(xf, yf, uf, vf, Nf, dt, Lx, Ly)
         fx = zeros(nx+2, ny+2)
         fy = zeros(nx+2, ny+2)  # Set fx & fy to zero
         distribute!(fx, fy, xf, yf, rho1, rho2, dx, dy, Nf)
         #-----------construct the density---------------
         for iter=1:maxit
             oldArray = CUDA.copy(r)
+            fx = CuArray(fx)
+            fy = CuArray(fy)
             @cuda blocks=cublocks threads=cuthreads construct_den!(r, fx, fy, beta, maxit, maxError, dx, dy, nx, ny)
             synchronize()
             # Check for convergence
